@@ -1,10 +1,18 @@
 node_modules
 
 # Backup files
-backups/*.tgz
-backups/*.tar.gz
-backups/*.sql
-backups/.tmp-*
+backups/*
+!backups/.gitkeep
+*.dump.gz
+*.tgz
+*.tar.gz
+*.sql.gz
+*.dump
+
+# Drill logs and reports
+drill-*.log
+*-drill-metrics.md
+compliance-report-*.md
 
 # Environment files with credentials
 .env.backup
@@ -14,6 +22,6 @@ backups/.tmp-*
 # n8n data directory (if stored locally)
 .n8n/
 
-# Database dumps
-*.sql.gz
-*.dump
+# Temporary directories
+.tmp-*
+/tmp/
