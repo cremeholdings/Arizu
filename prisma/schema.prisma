@@ -1,0 +1,213 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PlanType {
+  FREE
+  STARTER
+  PRO
+  ENTERPRISE
+}
+
+enum UsageType {
+  AUTOMATION_RUNS
+  WORKFLOW_EXECUTIONS
+  API_CALLS
+  STORAGE_MB
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique
+  email     String   @unique
+  firstName String?
+  lastName  String?
+  imageUrl  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Organization memberships
+  memberships OrganizationMember[]
+
+  // Automation runs initiated by this user
+  automationRuns AutomationRun[]
+
+  @@map("users")
+}
+
+model Organization {
+  id          String   @id @default(cuid())
+  clerkId     String   @unique
+  name        String
+  slug        String   @unique
+  imageUrl    String?
+  planType    PlanType @default(FREE)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Members
+  members OrganizationMember[]
+
+  // Usage tracking
+  usage         Usage[]
+  usageLimits   UsageLimit[]
+  usageCounters UsageCounter[]
+
+  // Automations and workflows
+  automations     Automation[]
+  automationRuns  AutomationRun[]
+  workflowPlans   WorkflowPlan[]
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id     String @id @default(cuid())
+  userId String
+  orgId  String
+  role   String @default("member") // member, admin, owner
+
+  user User         @relation(fields: [userId], references: [clerkId], onDelete: Cascade)
+  org  Organization @relation(fields: [orgId], references: [clerkId], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, orgId])
+  @@map("organization_members")
+}
+
+model UsageLimit {
+  id            String      @id @default(cuid())
+  organizationId String
+  usageType     UsageType
+  monthlyLimit  Int
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [clerkId], onDelete: Cascade)
+
+  @@unique([organizationId, usageType])
+  @@map("usage_limits")
+}
+
+model Usage {
+  id             String      @id @default(cuid())
+  organizationId String
+  usageType      UsageType
+  amount         Int
+  month          Int         // 1-12
+  year           Int
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [clerkId], onDelete: Cascade)
+
+  @@unique([organizationId, usageType, month, year])
+  @@index([organizationId, month, year])
+  @@map("usage")
+}
+
+model Automation {
+  id             String      @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  isActive       Boolean     @default(true)
+  n8nWorkflowId  String?     // Reference to n8n workflow
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization    @relation(fields: [organizationId], references: [clerkId], onDelete: Cascade)
+  plans        WorkflowPlan[]
+  runs         AutomationRun[]
+
+  @@index([organizationId])
+  @@index([organizationId, isActive])
+  @@map("automations")
+}
+
+model WorkflowPlan {
+  id           String  @id @default(cuid())
+  automationId String
+  organizationId String
+  name         String
+  description  String?
+  planJson     Json    // The compiled plan JSON
+  n8nJson      Json?   // The n8n workflow JSON
+  version      Int     @default(1)
+  isActive     Boolean @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  automation   Automation        @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  organization Organization      @relation(fields: [organizationId], references: [clerkId], onDelete: Cascade)
+  runs         AutomationRun[]
+
+  @@index([automationId])
+  @@index([organizationId])
+  @@index([automationId, isActive])
+  @@map("workflow_plans")
+}
+
+model AutomationRun {
+  id             String    @id @default(cuid())
+  automationId   String
+  planId         String?
+  organizationId String
+  userId         String
+  status         RunStatus @default(PENDING)
+  startedAt      DateTime  @default(now())
+  completedAt    DateTime?
+  errorMessage   String?   // Redacted error message
+  n8nExecutionId String?   // Reference to n8n execution
+  inputData      Json?     // Redacted input data
+  outputData     Json?     // Redacted output data
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  automation   Automation    @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  plan         WorkflowPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+  organization Organization  @relation(fields: [organizationId], references: [clerkId], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [clerkId], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([organizationId, startedAt])
+  @@index([automationId, status])
+  @@index([userId])
+  @@map("automation_runs")
+}
+
+model UsageCounter {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  periodKey          String   // Format: "YYYY-MM" (e.g., "2024-01")
+  monthlyRunsUsed    Int      @default(0)
+  monthlyRunsLimit   Int      @default(0)
+  workflowsCount     Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [clerkId], onDelete: Cascade)
+
+  @@unique([organizationId, periodKey])
+  @@index([organizationId])
+  @@index([periodKey])
+  @@map("usage_counters")
+}

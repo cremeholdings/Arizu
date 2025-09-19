@@ -1,0 +1,83 @@
+{
+  "version": "1",
+  "name": "Lead Router",
+  "steps": [
+    {
+      "type": "trigger.http",
+      "path": "/webhook/leads",
+      "secretHmac": true
+    },
+    {
+      "type": "filter",
+      "when": {
+        "field": "lead_score",
+        "op": "gt",
+        "value": 80
+      }
+    },
+    {
+      "type": "branch",
+      "cases": [
+        {
+          "when": {
+            "field": "company_size",
+            "op": "equals",
+            "value": "enterprise"
+          },
+          "steps": [
+            {
+              "type": "action.slack.postMessage",
+              "channel": "#sales-enterprise",
+              "text": "🔥 High-value enterprise lead: {{lead.name}} from {{lead.company}} (Score: {{lead.lead_score}})"
+            },
+            {
+              "type": "action.http.request",
+              "method": "POST",
+              "url": "https://api.salesforce.com/leads",
+              "headers": {
+                "Authorization": "Bearer {{secrets.salesforce_token}}",
+                "Content-Type": "application/json"
+              },
+              "body": {
+                "name": "{{lead.name}}",
+                "company": "{{lead.company}}",
+                "email": "{{lead.email}}",
+                "lead_source": "website",
+                "priority": "high"
+              }
+            }
+          ]
+        },
+        {
+          "when": {
+            "field": "company_size",
+            "op": "equals",
+            "value": "small"
+          },
+          "steps": [
+            {
+              "type": "action.slack.postMessage",
+              "channel": "#sales-smb",
+              "text": "📈 Qualified small business lead: {{lead.name}} from {{lead.company}} (Score: {{lead.lead_score}})"
+            }
+          ]
+        }
+      ],
+      "else": [
+        {
+          "type": "action.slack.postMessage",
+          "channel": "#sales-general",
+          "text": "📋 New qualified lead: {{lead.name}} from {{lead.company}} (Score: {{lead.lead_score}})"
+        },
+        {
+          "type": "custom.action",
+          "actionSlug": "enrich-lead-data",
+          "input": {
+            "email": "{{lead.email}}",
+            "company": "{{lead.company}}"
+          }
+        }
+      ]
+    }
+  ]
+}
