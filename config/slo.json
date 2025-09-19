@@ -1,0 +1,7 @@
+{
+  "availability_app_pct": 99.9,
+  "availability_n8n_pct": 99.5,
+  "latency_app_p95_ms": 2000,
+  "latency_api_p95_ms": 3000,
+  "error_budget_pct": 0.1
+}

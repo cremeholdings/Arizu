@@ -211,3 +211,27 @@ model UsageCounter {
   @@index([periodKey])
   @@map("usage_counters")
 }
+
+model FeatureFlag {
+  key         String   @id
+  description String?
+  defaultOn   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@map("feature_flags")
+}
+
+model FlagOverride {
+  id             String   @id @default(cuid())
+  flagKey        String
+  organizationId String?
+  userId         String?
+  enabled        Boolean
+  createdAt      DateTime @default(now())
+
+  @@unique([flagKey, organizationId, userId])
+  @@index([flagKey])
+  @@index([organizationId])
+  @@index([userId])
+  @@map("flag_overrides")
+}

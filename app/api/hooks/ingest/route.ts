@@ -4,6 +4,8 @@ import { recordRunStart, recordRunEnd, RunLimitError } from "@/middleware/runLim
 import { appendLog } from "@/lib/runs/logs"
 import { headers } from "next/headers"
 import { createHmac, timingSafeEqual } from "crypto"
+import { applyRateLimit, isAnyLimitExceeded, getMostRestrictive } from "@/lib/http/limit"
+import { withIdempotency, extractWebhookDeliveryId, IDEMPOTENCY_CONFIG } from "@/lib/http/idempotency"
 
 const runEventSchema = z.object({
   event: z.enum(["run.started", "run.completed", "run.failed"]),
@@ -74,6 +76,45 @@ async function authenticateWebhook(request: NextRequest, payload: string): Promi
 
 export async function POST(request: NextRequest) {
   try {
+    // Apply rate limiting
+    const clientIp = request.headers.get("x-forwarded-for") ||
+                    request.headers.get("x-real-ip") ||
+                    "127.0.0.1"
+
+    const rateLimitResults = await applyRateLimit("WEBHOOK_INGEST", "/api/hooks/ingest", {
+      ip: clientIp
+    })
+
+    if (isAnyLimitExceeded(rateLimitResults)) {
+      const mostRestrictive = getMostRestrictive(rateLimitResults)
+
+      console.warn("Webhook ingestion rate limited", {
+        ip: clientIp,
+        limit: mostRestrictive.limit,
+        remaining: mostRestrictive.remaining,
+        retryAfter: mostRestrictive.retryAfter
+      })
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Rate limit exceeded",
+          limit: mostRestrictive.limit,
+          remaining: mostRestrictive.remaining,
+          resetTime: mostRestrictive.resetTime
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(mostRestrictive.retryAfter || 60),
+            "X-RateLimit-Limit": String(mostRestrictive.limit),
+            "X-RateLimit-Remaining": String(mostRestrictive.remaining),
+            "X-RateLimit-Reset": String(mostRestrictive.resetTime)
+          }
+        }
+      )
+    }
+
     // Read raw payload for HMAC verification
     const payload = await request.text()
 
@@ -92,167 +133,87 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Parse JSON payload
-    let parsedPayload: unknown
-    try {
-      parsedPayload = JSON.parse(payload)
-    } catch (error) {
-      console.error("Invalid JSON in webhook payload", {
-        payloadPreview: payload.substring(0, 200),
-        error: error instanceof Error ? error.message : "Unknown error",
+    // Use idempotency protection with webhook delivery ID
+    const deliveryId = extractWebhookDeliveryId(request.headers)
+    if (!deliveryId) {
+      console.warn("Webhook missing delivery ID header", {
+        userAgent: request.headers.get("user-agent"),
+        availableHeaders: [...request.headers.keys()].filter(h => h.startsWith('x-'))
       })
-
-      return NextResponse.json(
-        { ok: false, error: "Invalid JSON payload" },
-        { status: 400 }
-      )
     }
 
-    // Validate payload schema
-    const validation = runEventSchema.safeParse(parsedPayload)
-    if (!validation.success) {
-      console.error("Invalid webhook payload schema", {
-        errors: validation.error.issues,
-        payload: parsedPayload,
-      })
+    const idempotentResult = await withIdempotency(
+      request,
+      IDEMPOTENCY_CONFIG.WEBHOOK_PROCESSING.ttlSec,
+      async () => {
+        // Parse JSON payload
+        let parsedPayload: unknown
+        try {
+          parsedPayload = JSON.parse(payload)
+        } catch (error) {
+          console.error("Invalid JSON in webhook payload", {
+            payloadPreview: payload.substring(0, 200),
+            error: error instanceof Error ? error.message : "Unknown error",
+          })
 
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Invalid payload schema",
-          details: validation.error.issues.map(issue => ({
-            field: issue.path.join("."),
-            message: issue.message,
-          }))
-        },
-        { status: 400 }
-      )
+          throw new Error("Invalid JSON payload")
+        }
+
+        // Validate payload schema
+        const validation = runEventSchema.safeParse(parsedPayload)
+        if (!validation.success) {
+          console.error("Invalid webhook payload schema", {
+            errors: validation.error.issues,
+            payload: parsedPayload,
+          })
+
+          throw new Error("Invalid payload schema")
+        }
+
+        const event = validation.data
+        console.log("Processing webhook event", {
+          event: event.event,
+          runId: event.runId.slice(0, 8) + "...",
+          orgId: event.orgId.slice(0, 8) + "...",
+          automationId: event.automationId?.slice(0, 8) + "...",
+          cached: false,
+          deliveryId: deliveryId?.substring(0, 20) + "..."
+        })
+
+        // Process event based on type
+        try {
+          return await processWebhookEvent(event)
+        } catch (error) {
+          if (error instanceof RunLimitError) {
+            return {
+              ok: false,
+              error: "Run limit error",
+              code: error.code,
+              details: {
+                currentUsage: error.currentUsage,
+                limit: error.limit,
+              }
+            }
+          }
+          throw error
+        }
+      },
+      { generateIdFromBody: !deliveryId }
+    )
+
+    if (idempotentResult.cached) {
+      console.log("Webhook event processed from cache", {
+        requestId: idempotentResult.requestId.substring(0, 20) + "...",
+        cached: true
+      })
     }
 
-    const event = validation.data
-    console.log("Processing webhook event", {
-      event: event.event,
-      runId: event.runId.slice(0, 8) + "...",
-      orgId: event.orgId.slice(0, 8) + "...",
-      automationId: event.automationId?.slice(0, 8) + "...",
-    })
-
-    // Process event based on type
-    try {
-      switch (event.event) {
-        case "run.started":
-          await recordRunStart(
-            event.orgId,
-            event.runId,
-            event.automationId,
-            event.userId
-          )
-
-          // Log initial step if available
-          if (event.data?.stepLogs?.length) {
-            for (const stepLog of event.data.stepLogs) {
-              await appendLog(event.runId, {
-                step: stepLog.step,
-                input: stepLog.input,
-                output: stepLog.output,
-                error: stepLog.error,
-              })
-            }
-          }
-          break
-
-        case "run.completed":
-          await recordRunEnd(event.orgId, event.runId, {
-            status: "ok",
-            executionTime: event.data?.executionTime,
-            outputData: event.data?.outputData,
-          })
-
-          // Log final steps if available
-          if (event.data?.stepLogs?.length) {
-            for (const stepLog of event.data.stepLogs) {
-              await appendLog(event.runId, {
-                step: stepLog.step,
-                input: stepLog.input,
-                output: stepLog.output,
-                error: stepLog.error,
-              })
-            }
-          }
-          break
-
-        case "run.failed":
-          await recordRunEnd(event.orgId, event.runId, {
-            status: "error",
-            errorMessage: event.data?.errorMessage,
-            executionTime: event.data?.executionTime,
-          })
-
-          // Log error steps if available
-          if (event.data?.stepLogs?.length) {
-            for (const stepLog of event.data.stepLogs) {
-              await appendLog(event.runId, {
-                step: stepLog.step,
-                input: stepLog.input,
-                output: stepLog.output,
-                error: stepLog.error,
-              })
-            }
-          }
-          break
-
-        default:
-          console.warn("Unknown webhook event type", {
-            event: event.event,
-            runId: event.runId.slice(0, 8) + "...",
-          })
-
-          return NextResponse.json(
-            { ok: false, error: "Unknown event type" },
-            { status: 400 }
-          )
-      }
-
-      console.log("Webhook event processed successfully", {
-        event: event.event,
-        runId: event.runId.slice(0, 8) + "...",
-        orgId: event.orgId.slice(0, 8) + "...",
-      })
-
-      return NextResponse.json({ ok: true })
-
-    } catch (error) {
-      console.error("Error processing webhook event", {
-        event: event.event,
-        runId: event.runId.slice(0, 8) + "...",
-        orgId: event.orgId.slice(0, 8) + "...",
-        error: error instanceof Error ? error.message : "Unknown error",
-      })
-
-      if (error instanceof RunLimitError) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: "Run limit error",
-            code: error.code,
-            details: {
-              currentUsage: error.currentUsage,
-              limit: error.limit,
-            }
-          },
-          { status: 429 }
-        )
-      }
-
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Failed to process webhook event",
-          details: error instanceof Error ? error.message : "Unknown error"
-        },
-        { status: 500 }
-      )
+    const response = idempotentResult.value
+    if (!response.ok && response.code === "RUN_LIMIT_EXCEEDED") {
+      return NextResponse.json(response, { status: 429 })
     }
+
+    return NextResponse.json(response)
 
   } catch (error) {
     console.error("Webhook ingestion error", {
@@ -269,6 +230,87 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
+}
+
+async function processWebhookEvent(event: z.infer<typeof runEventSchema>) {
+  switch (event.event) {
+    case "run.started":
+      await recordRunStart(
+        event.orgId,
+        event.runId,
+        event.automationId,
+        event.userId
+      )
+
+      // Log initial step if available
+      if (event.data?.stepLogs?.length) {
+        for (const stepLog of event.data.stepLogs) {
+          await appendLog(event.runId, {
+            step: stepLog.step,
+            input: stepLog.input,
+            output: stepLog.output,
+            error: stepLog.error,
+          })
+        }
+      }
+      break
+
+    case "run.completed":
+      await recordRunEnd(event.orgId, event.runId, {
+        status: "ok",
+        executionTime: event.data?.executionTime,
+        outputData: event.data?.outputData,
+      })
+
+      // Log final steps if available
+      if (event.data?.stepLogs?.length) {
+        for (const stepLog of event.data.stepLogs) {
+          await appendLog(event.runId, {
+            step: stepLog.step,
+            input: stepLog.input,
+            output: stepLog.output,
+            error: stepLog.error,
+          })
+        }
+      }
+      break
+
+    case "run.failed":
+      await recordRunEnd(event.orgId, event.runId, {
+        status: "error",
+        errorMessage: event.data?.errorMessage,
+        executionTime: event.data?.executionTime,
+      })
+
+      // Log error steps if available
+      if (event.data?.stepLogs?.length) {
+        for (const stepLog of event.data.stepLogs) {
+          await appendLog(event.runId, {
+            step: stepLog.step,
+            input: stepLog.input,
+            output: stepLog.output,
+            error: stepLog.error,
+          })
+        }
+      }
+      break
+
+    default:
+      console.warn("Unknown webhook event type", {
+        event: event.event,
+        runId: event.runId.slice(0, 8) + "...",
+      })
+
+      throw new Error(`Unknown event type: ${event.event}`)
+  }
+
+  console.log("Webhook event processed successfully", {
+    event: event.event,
+    runId: event.runId.slice(0, 8) + "...",
+    orgId: event.orgId.slice(0, 8) + "...",
+  })
+
+  return { ok: true }
 }
 
 // Health check endpoint

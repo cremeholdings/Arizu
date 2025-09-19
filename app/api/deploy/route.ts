@@ -6,6 +6,8 @@ import type { Plan } from "@/lib/plan/schema"
 import { compileToN8N, CompilerError } from "@/lib/compiler/n8n"
 import { createN8nClient, N8nError } from "@/lib/n8n/client"
 import { getCurrentUsage } from "@/lib/plans"
+import { applyRateLimit, isAnyLimitExceeded, getMostRestrictive } from "@/lib/http/limit"
+import { withCircuitBreaker, CircuitBreakerError } from "@/lib/http/circuit"
 
 const requestSchema = z.object({
   plan: z.unknown(),
@@ -115,6 +117,55 @@ export async function POST(request: NextRequest) {
           }
         },
         { status: 401 }
+      )
+    }
+
+    // Apply rate limiting
+    const clientIp = request.headers.get("x-forwarded-for") ||
+                    request.headers.get("x-real-ip") ||
+                    "127.0.0.1"
+
+    const rateLimitResults = await applyRateLimit("DEPLOY", "/api/deploy", {
+      ip: clientIp,
+      orgId,
+      userId
+    })
+
+    if (isAnyLimitExceeded(rateLimitResults)) {
+      const mostRestrictive = getMostRestrictive(rateLimitResults)
+
+      console.warn("Deploy rate limited", {
+        userId: userId.slice(0, 8) + "...",
+        orgId: orgId.slice(0, 8) + "...",
+        ip: clientIp,
+        limit: mostRestrictive.limit,
+        remaining: mostRestrictive.remaining,
+        retryAfter: mostRestrictive.retryAfter
+      })
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: {
+            code: "RATE_LIMIT",
+            message: "Rate limit exceeded",
+            details: {
+              limit: mostRestrictive.limit,
+              remaining: mostRestrictive.remaining,
+              resetTime: mostRestrictive.resetTime,
+              suggestion: "Please wait before deploying again"
+            }
+          }
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(mostRestrictive.retryAfter || 60),
+            "X-RateLimit-Limit": String(mostRestrictive.limit),
+            "X-RateLimit-Remaining": String(mostRestrictive.remaining),
+            "X-RateLimit-Reset": String(mostRestrictive.resetTime)
+          }
+        }
       )
     }
 
@@ -230,22 +281,30 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Step 4: Deploy to n8n
+    // Step 4: Deploy to n8n with circuit breaker protection
     let deployResult
     try {
-      const n8nClient = createN8nClient()
+      deployResult = await withCircuitBreaker(
+        `n8n-deploy-${orgId}`,
+        "N8N_API",
+        async () => {
+          const n8nClient = createN8nClient()
 
-      // Health check first
-      const isHealthy = await n8nClient.healthCheck()
-      if (!isHealthy) {
-        throw new N8nError(0, "N8n instance is not reachable")
-      }
+          // Health check first
+          const isHealthy = await n8nClient.healthCheck()
+          if (!isHealthy) {
+            throw new N8nError(0, "N8n instance is not reachable")
+          }
 
-      // Upsert workflow
-      deployResult = await n8nClient.upsertByName(workflowName, compiledWorkflow)
+          // Upsert workflow
+          const result = await n8nClient.upsertByName(workflowName, compiledWorkflow)
 
-      // Activate workflow
-      await n8nClient.activateWorkflow(deployResult.workflowId, true)
+          // Activate workflow
+          await n8nClient.activateWorkflow(result.workflowId, true)
+
+          return result
+        }
+      )
 
       console.log("Workflow deployed successfully", {
         userId: userId.slice(0, 8) + "...",
