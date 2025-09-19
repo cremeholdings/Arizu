@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
+import { useSearchParams } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -8,6 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { PlanCard } from '@/components/PlanCard'
 import { RunTestButton } from '@/components/RunTestButton'
+import { UpgradeDialog } from '@/components/UpgradeDialog'
 import {
   useChatStore,
   canGeneratePlan,
@@ -19,6 +21,7 @@ import {
   isCircuitBreakerError,
   getRetryMessage
 } from '@/stores/chat'
+import { useUIStore } from '@/stores/ui'
 import {
   Loader2,
   Send,
@@ -41,6 +44,8 @@ const examplePrompts = [
 ]
 
 export default function NewAutomationPage() {
+  const searchParams = useSearchParams()
+
   const {
     text,
     plan,
@@ -59,12 +64,28 @@ export default function NewAutomationPage() {
     clearResults
   } = useChatStore()
 
+  const {
+    dialogs,
+    openUpgradeDialog,
+    closeUpgradeDialog
+  } = useUIStore()
+
   const [deploymentStatus, setDeploymentStatus] = useState<'idle' | 'deploying' | 'success' | 'error'>('idle')
+  const [templatePrefilled, setTemplatePrefilled] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   const canGenerate = canGeneratePlan({ text, status, plan, error, testResult, deployResult, generationAttempts, lastGeneratedText: '' })
   const canDeploy = canDeployPlan({ text, status, plan, error, testResult, deployResult, generationAttempts, lastGeneratedText: '' })
   const isLoading = isOperationInProgress(status) || deploymentStatus === 'deploying'
+
+  // Helper to check for plan limit or feature locked errors
+  const handlePlanLimitError = (data: any) => {
+    if (data.code === 'PLAN_LIMIT' || data.code === 'FEATURE_LOCKED') {
+      openUpgradeDialog(data.code, data.meta)
+      return true
+    }
+    return false
+  }
 
   useEffect(() => {
     // Auto-resize textarea
@@ -73,6 +94,48 @@ export default function NewAutomationPage() {
       textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`
     }
   }, [text])
+
+  useEffect(() => {
+    // Handle template prefilling from URL params or localStorage
+    if (templatePrefilled) return
+
+    const templateParam = searchParams.get('template')
+    let templateData = null
+
+    // Check URL param first
+    if (templateParam) {
+      try {
+        templateData = JSON.parse(decodeURIComponent(templateParam))
+      } catch (error) {
+        console.warn('Failed to parse template URL param:', error)
+      }
+    }
+
+    // Fallback to localStorage
+    if (!templateData) {
+      try {
+        const storedTemplate = localStorage.getItem('selectedTemplate')
+        if (storedTemplate) {
+          templateData = JSON.parse(storedTemplate)
+          // Clear from localStorage after use
+          localStorage.removeItem('selectedTemplate')
+        }
+      } catch (error) {
+        console.warn('Failed to parse template from localStorage:', error)
+      }
+    }
+
+    // Apply template if found
+    if (templateData && templateData.promptSeed && !text.trim()) {
+      setText(templateData.promptSeed)
+      setTemplatePrefilled(true)
+
+      console.log('Template prefilled:', {
+        templateId: templateData.id,
+        promptLength: templateData.promptSeed.length
+      })
+    }
+  }, [searchParams, templatePrefilled, text, setText])
 
   const handleGeneratePlan = async () => {
     if (!canGenerate || !text.trim()) return
@@ -100,7 +163,12 @@ export default function NewAutomationPage() {
       const data = await response.json()
 
       if (!response.ok) {
-        // Handle different error types
+        // Check for plan limit or feature locked errors first
+        if (handlePlanLimitError(data)) {
+          return
+        }
+
+        // Handle other error types
         if (response.status === 429) {
           const retryMessage = getRetryMessage(data)
           setError(retryMessage)
@@ -161,7 +229,13 @@ export default function NewAutomationPage() {
       const data = await response.json()
 
       if (!response.ok) {
-        // Handle different error types
+        // Check for plan limit or feature locked errors first
+        if (handlePlanLimitError(data)) {
+          setDeploymentStatus('error')
+          return
+        }
+
+        // Handle other error types
         if (response.status === 429) {
           const retryMessage = getRetryMessage(data)
           setError(retryMessage)
@@ -451,6 +525,14 @@ export default function NewAutomationPage() {
           </CardContent>
         </Card>
       )}
+
+      {/* Upgrade Dialog */}
+      <UpgradeDialog
+        open={dialogs.upgradeDialogState.open}
+        onClose={closeUpgradeDialog}
+        code={dialogs.upgradeDialogState.code!}
+        detail={dialogs.upgradeDialogState.detail}
+      />
     </div>
   )
 }

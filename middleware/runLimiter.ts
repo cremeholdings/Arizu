@@ -1,15 +1,25 @@
 import { db } from "@/lib/db"
 import { getCurrentUsage, incrementRunsUsage } from "@/lib/plans"
 import { RunStatus } from "@prisma/client"
+import { TypedError, throwPlanLimit, LimitMeta } from "@/lib/errors"
 
-export class RunLimitError extends Error {
+export class RunLimitError extends TypedError {
   constructor(
     public code: string,
     message: string,
     public currentUsage?: number,
     public limit?: number
   ) {
-    super(message)
+    const meta: LimitMeta = {
+      limit: limit || 0,
+      used: currentUsage || 0
+    }
+    super({
+      ok: false,
+      code: 'PLAN_LIMIT',
+      message,
+      meta
+    })
     this.name = "RunLimitError"
   }
 }
@@ -32,11 +42,13 @@ export async function assertRunAllowance(orgId: string): Promise<void> {
         limit: usage.monthlyRunsLimit,
       })
 
-      throw new RunLimitError(
-        "MONTHLY_RUN_LIMIT_EXCEEDED",
+      throwPlanLimit(
         `Monthly run limit of ${usage.monthlyRunsLimit} exceeded. Current usage: ${usage.monthlyRunsUsed}`,
-        usage.monthlyRunsUsed,
-        usage.monthlyRunsLimit
+        {
+          limit: usage.monthlyRunsLimit,
+          used: usage.monthlyRunsUsed,
+          planType: 'runs'
+        }
       )
     }
 

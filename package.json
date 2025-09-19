@@ -13,6 +13,8 @@
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",
     "db:seed": "tsx scripts/dev-seed.ts",
+    "seed:limits": "tsx scripts/dev-seed-limit-demo.ts",
+    "reset:usage": "tsx scripts/dev-reset-usage.ts",
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:run": "vitest run",

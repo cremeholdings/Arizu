@@ -1,10 +1,18 @@
 import { create } from "zustand"
+import type { LimitMeta, FeatureMeta } from "@/lib/errors"
+
+interface UpgradeDialogState {
+  open: boolean
+  code?: 'PLAN_LIMIT' | 'FEATURE_LOCKED'
+  detail?: LimitMeta | FeatureMeta
+}
 
 interface DialogState {
   upgradeDialog: boolean
   deleteConfirmDialog: boolean
   inviteTeamDialog: boolean
   createAutomationDialog: boolean
+  upgradeDialogState: UpgradeDialogState
 }
 
 interface ChatComposerState {
@@ -37,6 +45,8 @@ interface UIState {
 
 interface UIActions {
   setDialog: (dialog: keyof DialogState, open: boolean) => void
+  openUpgradeDialog: (code: 'PLAN_LIMIT' | 'FEATURE_LOCKED', detail?: LimitMeta | FeatureMeta) => void
+  closeUpgradeDialog: () => void
   setChatComposerInput: (input: string) => void
   setChatGenerating: (generating: boolean) => void
   setSelectedTemplate: (templateId: string | null) => void
@@ -61,6 +71,11 @@ const initialDialogs: DialogState = {
   deleteConfirmDialog: false,
   inviteTeamDialog: false,
   createAutomationDialog: false,
+  upgradeDialogState: {
+    open: false,
+    code: undefined,
+    detail: undefined,
+  },
 }
 
 const initialChatComposer: ChatComposerState = {
@@ -170,5 +185,31 @@ export const useUIStore = create<UIStore>((set) => ({
 
   setTemplatePreview: (templateId) => {
     set({ templatePreviewSelection: templateId })
+  },
+
+  openUpgradeDialog: (code, detail) => {
+    set((state) => ({
+      dialogs: {
+        ...state.dialogs,
+        upgradeDialogState: {
+          open: true,
+          code,
+          detail,
+        },
+      },
+    }))
+  },
+
+  closeUpgradeDialog: () => {
+    set((state) => ({
+      dialogs: {
+        ...state.dialogs,
+        upgradeDialogState: {
+          open: false,
+          code: undefined,
+          detail: undefined,
+        },
+      },
+    }))
   },
 }))

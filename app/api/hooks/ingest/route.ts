@@ -6,6 +6,14 @@ import { headers } from "next/headers"
 import { createHmac, timingSafeEqual } from "crypto"
 import { applyRateLimit, isAnyLimitExceeded, getMostRestrictive } from "@/lib/http/limit"
 import { withIdempotency, extractWebhookDeliveryId, IDEMPOTENCY_CONFIG } from "@/lib/http/idempotency"
+import {
+  TypedError,
+  getErrorStatusCode,
+  unauthorized,
+  rateLimit,
+  badRequest,
+  serverError
+} from "@/lib/errors"
 
 const runEventSchema = z.object({
   event: z.enum(["run.started", "run.completed", "run.failed"]),
@@ -95,24 +103,25 @@ export async function POST(request: NextRequest) {
         retryAfter: mostRestrictive.retryAfter
       })
 
-      return NextResponse.json(
+      const errorResponse = rateLimit(
+        "Rate limit exceeded. Please wait before sending more webhooks.",
+        mostRestrictive.retryAfter || 60,
         {
-          ok: false,
-          error: "Rate limit exceeded",
-          limit: mostRestrictive.limit,
-          remaining: mostRestrictive.remaining,
-          resetTime: mostRestrictive.resetTime
-        },
-        {
-          status: 429,
-          headers: {
-            "Retry-After": String(mostRestrictive.retryAfter || 60),
-            "X-RateLimit-Limit": String(mostRestrictive.limit),
-            "X-RateLimit-Remaining": String(mostRestrictive.remaining),
-            "X-RateLimit-Reset": String(mostRestrictive.resetTime)
-          }
+          retryAfterSec: mostRestrictive.retryAfter || 60,
+          resetTime: mostRestrictive.resetTime,
+          endpoint: "/api/hooks/ingest"
         }
       )
+
+      return NextResponse.json(errorResponse, {
+        status: getErrorStatusCode(errorResponse),
+        headers: {
+          "Retry-After": String(mostRestrictive.retryAfter || 60),
+          "X-RateLimit-Limit": String(mostRestrictive.limit),
+          "X-RateLimit-Remaining": String(mostRestrictive.remaining),
+          "X-RateLimit-Reset": String(mostRestrictive.resetTime)
+        }
+      })
     }
 
     // Read raw payload for HMAC verification
@@ -184,16 +193,9 @@ export async function POST(request: NextRequest) {
         try {
           return await processWebhookEvent(event)
         } catch (error) {
-          if (error instanceof RunLimitError) {
-            return {
-              ok: false,
-              error: "Run limit error",
-              code: error.code,
-              details: {
-                currentUsage: error.currentUsage,
-                limit: error.limit,
-              }
-            }
+          if (error instanceof TypedError) {
+            // Return the error response directly for processing later
+            return error.response
           }
           throw error
         }
@@ -209,26 +211,49 @@ export async function POST(request: NextRequest) {
     }
 
     const response = idempotentResult.value
-    if (!response.ok && response.code === "RUN_LIMIT_EXCEEDED") {
-      return NextResponse.json(response, { status: 429 })
+
+    // Handle error responses with proper status codes
+    if (!response.ok && response.code) {
+      const statusCode = getErrorStatusCode(response)
+      const headers: Record<string, string> = {}
+
+      // Add Retry-After header for rate limit errors
+      if (response.retryAfterSec) {
+        headers["Retry-After"] = String(response.retryAfterSec)
+      }
+
+      return NextResponse.json(response, {
+        status: statusCode,
+        headers: Object.keys(headers).length > 0 ? headers : undefined
+      })
     }
 
     return NextResponse.json(response)
 
   } catch (error) {
+    // Handle typed errors
+    if (error instanceof TypedError) {
+      const response = error.response
+      const headers: Record<string, string> = {}
+
+      // Add Retry-After header for rate limit errors
+      if (response.retryAfterSec) {
+        headers["Retry-After"] = String(response.retryAfterSec)
+      }
+
+      return NextResponse.json(response, {
+        status: getErrorStatusCode(response),
+        headers: Object.keys(headers).length > 0 ? headers : undefined
+      })
+    }
+
     console.error("Webhook ingestion error", {
       error: error instanceof Error ? error.message : "Unknown error",
       stack: error instanceof Error ? error.stack : undefined,
     })
 
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Internal server error",
-        message: "Failed to process webhook"
-      },
-      { status: 500 }
-    )
+    const errorResponse = serverError("Internal server error. Failed to process webhook.")
+    return NextResponse.json(errorResponse, { status: getErrorStatusCode(errorResponse) })
   }
 }
 

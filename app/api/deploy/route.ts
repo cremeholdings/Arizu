@@ -8,6 +8,16 @@ import { createN8nClient, N8nError } from "@/lib/n8n/client"
 import { getCurrentUsage } from "@/lib/plans"
 import { applyRateLimit, isAnyLimitExceeded, getMostRestrictive } from "@/lib/http/limit"
 import { withCircuitBreaker, CircuitBreakerError } from "@/lib/http/circuit"
+import { assertWorkflowLimit, validateWorkflowPlan } from "@/middleware/planGuard"
+import {
+  TypedError,
+  getErrorStatusCode,
+  unauthorized,
+  rateLimit,
+  validationError,
+  compilationError,
+  serverError
+} from "@/lib/errors"
 
 const requestSchema = z.object({
   plan: z.unknown(),
@@ -108,16 +118,8 @@ export async function POST(request: NextRequest) {
     const { userId, orgId } = auth()
 
     if (!userId || !orgId) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: {
-            code: "AUTHENTICATION_REQUIRED",
-            message: "Authentication required"
-          }
-        },
-        { status: 401 }
-      )
+      const errorResponse = unauthorized()
+      return NextResponse.json(errorResponse, { status: getErrorStatusCode(errorResponse) })
     }
 
     // Apply rate limiting
@@ -143,30 +145,25 @@ export async function POST(request: NextRequest) {
         retryAfter: mostRestrictive.retryAfter
       })
 
-      return NextResponse.json(
+      const errorResponse = rateLimit(
+        "Rate limit exceeded. Please wait before deploying again.",
+        mostRestrictive.retryAfter || 60,
         {
-          ok: false,
-          error: {
-            code: "RATE_LIMIT",
-            message: "Rate limit exceeded",
-            details: {
-              limit: mostRestrictive.limit,
-              remaining: mostRestrictive.remaining,
-              resetTime: mostRestrictive.resetTime,
-              suggestion: "Please wait before deploying again"
-            }
-          }
-        },
-        {
-          status: 429,
-          headers: {
-            "Retry-After": String(mostRestrictive.retryAfter || 60),
-            "X-RateLimit-Limit": String(mostRestrictive.limit),
-            "X-RateLimit-Remaining": String(mostRestrictive.remaining),
-            "X-RateLimit-Reset": String(mostRestrictive.resetTime)
-          }
+          retryAfterSec: mostRestrictive.retryAfter || 60,
+          resetTime: mostRestrictive.resetTime,
+          endpoint: "/api/deploy"
         }
       )
+
+      return NextResponse.json(errorResponse, {
+        status: getErrorStatusCode(errorResponse),
+        headers: {
+          "Retry-After": String(mostRestrictive.retryAfter || 60),
+          "X-RateLimit-Limit": String(mostRestrictive.limit),
+          "X-RateLimit-Remaining": String(mostRestrictive.remaining),
+          "X-RateLimit-Reset": String(mostRestrictive.resetTime)
+        }
+      })
     }
 
     // Parse and validate request body
@@ -211,36 +208,18 @@ export async function POST(request: NextRequest) {
         issues: planValidation.issues,
       })
 
-      return NextResponse.json(
-        {
-          ok: false,
-          error: mapValidationError(planValidation.issues)
-        },
-        { status: 422 }
+      const errorResponse = validationError(
+        "Plan validation failed",
+        planValidation.issues
       )
+      return NextResponse.json(errorResponse, { status: getErrorStatusCode(errorResponse) })
     }
 
     const validPlan = plan as Plan
 
-    // Step 2: Check workflow limits
-    const usage = await getCurrentUsage(orgId)
-    if (usage.workflowsCount >= usage.workflowsLimit) {
-      console.warn("Workflow limit exceeded during deploy", {
-        userId: userId.slice(0, 8) + "...",
-        orgId: orgId.slice(0, 8) + "...",
-        workflowName,
-        current: usage.workflowsCount,
-        limit: usage.workflowsLimit,
-      })
-
-      return NextResponse.json(
-        {
-          ok: false,
-          error: mapPlanLimitError()
-        },
-        { status: 403 }
-      )
-    }
+    // Step 2: Check workflow and plan limits
+    await assertWorkflowLimit(orgId)
+    await validateWorkflowPlan(orgId, validPlan)
 
     // Step 3: Compile plan to n8n workflow
     let compiledWorkflow
@@ -256,29 +235,18 @@ export async function POST(request: NextRequest) {
       })
 
       if (error instanceof CompilerError) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: mapCompilerError(error)
-          },
-          { status: 422 }
-        )
+        const errorResponse = compilationError(error.message, {
+          stepType: error.step?.type,
+          suggestion: "Check your plan structure and step types"
+        })
+        return NextResponse.json(errorResponse, { status: getErrorStatusCode(errorResponse) })
       }
 
-      return NextResponse.json(
-        {
-          ok: false,
-          error: {
-            code: "COMPILATION_ERROR",
-            message: "Failed to compile plan to workflow",
-            details: {
-              error: error instanceof Error ? error.message : "Unknown error",
-              suggestion: "Check your plan structure and try again"
-            }
-          }
-        },
-        { status: 500 }
-      )
+      const errorResponse = compilationError("Failed to compile plan to workflow", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        suggestion: "Check your plan structure and try again"
+      })
+      return NextResponse.json(errorResponse, { status: getErrorStatusCode(errorResponse) })
     }
 
     // Step 4: Deploy to n8n with circuit breaker protection
@@ -360,23 +328,34 @@ export async function POST(request: NextRequest) {
     })
 
   } catch (error) {
+    // Handle typed errors
+    if (error instanceof TypedError) {
+      console.warn("Deploy API typed error", {
+        code: error.response.code,
+        message: error.response.message,
+        meta: error.response.meta
+      })
+
+      const response = error.response
+      const headers: Record<string, string> = {}
+
+      // Add Retry-After header for rate limit errors
+      if (response.retryAfterSec) {
+        headers["Retry-After"] = String(response.retryAfterSec)
+      }
+
+      return NextResponse.json(response, {
+        status: getErrorStatusCode(response),
+        headers: Object.keys(headers).length > 0 ? headers : undefined
+      })
+    }
+
     console.error("Deploy API error", {
       error: error instanceof Error ? error.message : "Unknown error",
       stack: error instanceof Error ? error.stack : undefined,
     })
 
-    return NextResponse.json(
-      {
-        ok: false,
-        error: {
-          code: "INTERNAL_ERROR",
-          message: "Internal server error",
-          details: {
-            suggestion: "Please try again in a moment. If the problem persists, contact support."
-          }
-        }
-      },
-      { status: 500 }
-    )
+    const errorResponse = serverError("Internal server error. Please try again in a moment.")
+    return NextResponse.json(errorResponse, { status: getErrorStatusCode(errorResponse) })
   }
 }

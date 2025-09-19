@@ -1,1 +1,19 @@
 node_modules
+
+# Backup files
+backups/*.tgz
+backups/*.tar.gz
+backups/*.sql
+backups/.tmp-*
+
+# Environment files with credentials
+.env.backup
+.env.local
+.env.production
+
+# n8n data directory (if stored locally)
+.n8n/
+
+# Database dumps
+*.sql.gz
+*.dump
