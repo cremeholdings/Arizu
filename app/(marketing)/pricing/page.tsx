@@ -21,7 +21,7 @@ function PricingTier({ plan, isCurrentPlan }: PricingTierProps) {
     if (plan.key === "FREE") {
       return (
         <Button asChild size="lg" className="w-full">
-          <Link href="/sign-up">Start Free</Link>
+          <Link href={"/sign-up" as any}>Start Free</Link>
         </Button>
       )
     }
@@ -38,7 +38,7 @@ function PricingTier({ plan, isCurrentPlan }: PricingTierProps) {
 
     return (
       <Button asChild size="lg" className="w-full">
-        <Link href="/sign-up">Get Started</Link>
+        <Link href={"/sign-up" as any}>Get Started</Link>
       </Button>
     )
   }

@@ -1,0 +1,174 @@
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: arizu_traefik_prod
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.file.filename=/traefik.yml
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/acme.json
+      - --certificatesresolvers.letsencrypt.acme.keytype=EC256
+      - --log.level=INFO
+      - --api.dashboard=false
+      - --metrics.prometheus=true
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/traefik.yml:ro
+      - ./traefik/acme.json:/acme.json
+    networks:
+      - prod_net
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    environment:
+      - EMAIL=${EMAIL}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)
+      - traefik.http.routers.traefik.entrypoints=websecure
+      - traefik.http.routers.traefik.tls.certresolver=letsencrypt
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik.middlewares=auth
+      - traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_AUTH:-admin:$$2y$$10$$0000000000000000000000000000000000000000000000000000000000}
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: arizu_n8n_prod
+    restart: unless-stopped
+    depends_on:
+      traefik:
+        condition: service_healthy
+    environment:
+      # Core n8n configuration
+      N8N_HOST: ${DOMAIN}
+      N8N_PROTOCOL: https
+      N8N_PORT: 5678
+      N8N_LISTEN_ADDRESS: 0.0.0.0
+
+      # Database configuration
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: ${DB_HOST}
+      DB_POSTGRESDB_PORT: ${DB_PORT:-5432}
+      DB_POSTGRESDB_USER: ${DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${DB_PASSWORD}
+      DB_POSTGRESDB_DATABASE: ${DB_NAME}
+      DB_POSTGRESDB_SCHEMA: public
+      DB_POSTGRESDB_SSL_CA: ""
+      DB_POSTGRESDB_SSL_CERT: ""
+      DB_POSTGRESDB_SSL_KEY: ""
+      DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED: "true"
+
+      # Redis/Queue configuration
+      QUEUE_BULL_REDIS_HOST: ${REDIS_HOST}
+      QUEUE_BULL_REDIS_PORT: ${REDIS_PORT:-6379}
+      QUEUE_BULL_REDIS_DB: 0
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
+      # Security and encryption
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_USER_MANAGEMENT_JWT_SECRET: ${N8N_JWT_SECRET:-}
+
+      # Production settings
+      N8N_LOG_LEVEL: info
+      N8N_METRICS: true
+      N8N_DIAGNOSTICS_ENABLED: false
+      NODE_ENV: production
+      GENERIC_TIMEZONE: ${TZ:-UTC}
+
+      # Security settings
+      N8N_SECURE_COOKIE: true
+      N8N_BASIC_AUTH_ACTIVE: false
+
+      # Webhook configuration
+      WEBHOOK_URL: https://${DOMAIN}
+      N8N_PAYLOAD_SIZE_MAX: 16
+
+      # Execution settings
+      EXECUTIONS_PROCESS: main
+      EXECUTIONS_MODE: regular
+      EXECUTIONS_TIMEOUT: 3600
+      EXECUTIONS_TIMEOUT_MAX: 7200
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: false
+
+      # Performance settings
+      N8N_CONCURRENCY_PRODUCTION_LIMIT: ${N8N_CONCURRENCY_LIMIT:-10}
+
+      # Email configuration (optional)
+      N8N_EMAIL_MODE: ${EMAIL_MODE:-}
+      N8N_SMTP_HOST: ${SMTP_HOST:-}
+      N8N_SMTP_PORT: ${SMTP_PORT:-587}
+      N8N_SMTP_USER: ${SMTP_USER:-}
+      N8N_SMTP_PASS: ${SMTP_PASS:-}
+      N8N_SMTP_SENDER: ${SMTP_SENDER:-}
+      N8N_SMTP_SSL: ${SMTP_SSL:-true}
+
+    volumes:
+      - n8n_data_prod:/home/node/.n8n
+    networks:
+      - prod_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    labels:
+      # Traefik routing
+      - traefik.enable=true
+      - traefik.http.routers.n8n.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls=true
+      - traefik.http.routers.n8n.tls.certresolver=letsencrypt
+      - traefik.http.routers.n8n.service=n8n
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+      # Security middlewares
+      - traefik.http.routers.n8n.middlewares=n8n-security,rate-limit
+
+      # Security headers middleware
+      - traefik.http.middlewares.n8n-security.headers.accesscontrolallowmethods=GET,OPTIONS,PUT,POST,DELETE,PATCH
+      - traefik.http.middlewares.n8n-security.headers.accesscontrolallowheaders=*
+      - traefik.http.middlewares.n8n-security.headers.accesscontrolalloworiginlist=https://${DOMAIN}
+      - traefik.http.middlewares.n8n-security.headers.accesscontrolmaxage=100
+      - traefik.http.middlewares.n8n-security.headers.addvaryheader=true
+      - traefik.http.middlewares.n8n-security.headers.referrerpolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.n8n-security.headers.stsincludesubdomains=true
+      - traefik.http.middlewares.n8n-security.headers.stspreload=true
+      - traefik.http.middlewares.n8n-security.headers.stsseconds=31536000
+      - traefik.http.middlewares.n8n-security.headers.forcestsheader=true
+      - traefik.http.middlewares.n8n-security.headers.framedeny=true
+      - traefik.http.middlewares.n8n-security.headers.contenttypenosniff=true
+      - traefik.http.middlewares.n8n-security.headers.browserxssfilter=true
+      - traefik.http.middlewares.n8n-security.headers.customrequestheaders.X-Forwarded-Proto=https
+
+      # Rate limiting middleware
+      - traefik.http.middlewares.rate-limit.ratelimit.average=100
+      - traefik.http.middlewares.rate-limit.ratelimit.period=1m
+      - traefik.http.middlewares.rate-limit.ratelimit.burst=50
+
+volumes:
+  n8n_data_prod:
+    name: arizu_n8n_data_prod
+    driver: local
+
+networks:
+  prod_net:
+    name: arizu_prod_net
+    driver: bridge
+    external: false

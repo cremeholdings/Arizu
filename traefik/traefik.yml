@@ -1,0 +1,233 @@
+# ====================================================================
+# Traefik Production Configuration for Arizu
+# ====================================================================
+#
+# This configuration provides:
+# - Automatic HTTPS with Let's Encrypt
+# - Security headers and middleware
+# - Rate limiting and protection
+# - Metrics and monitoring
+#
+# ====================================================================
+
+# Global Configuration
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+# Entry Points
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entrypoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+    http:
+      middlewares:
+        - securityHeaders@file
+        - gzip@file
+      tls:
+        options: modern@file
+
+# Certificate Resolvers
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: ${EMAIL}
+      storage: /acme.json
+      keyType: EC256
+      tlsChallenge: {}
+      # Alternative: HTTP challenge (uncomment if TLS challenge fails)
+      # httpChallenge:
+      #   entryPoint: web
+      # Alternative: DNS challenge (requires DNS provider setup)
+      # dnsChallenge:
+      #   provider: cloudflare
+      #   delayBeforeCheck: 60s
+
+# Providers
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    watch: true
+    network: arizu_prod_net
+
+  file:
+    filename: /traefik.yml
+    watch: false
+
+# API and Dashboard (disabled by default for security)
+api:
+  dashboard: false
+  debug: false
+  insecure: false
+
+# Logging
+log:
+  level: INFO
+  format: json
+
+# Access Logs
+accessLog:
+  format: json
+  fields:
+    defaultMode: keep
+    names:
+      ClientUsername: drop
+    headers:
+      defaultMode: keep
+      names:
+        User-Agent: redact
+        Authorization: drop
+        Cookie: drop
+
+# Metrics
+metrics:
+  prometheus:
+    exposedPort: 9090
+    addEntryPointsLabels: true
+    addServicesLabels: true
+
+# TLS Options
+tls:
+  options:
+    modern:
+      minVersion: "VersionTLS12"
+      maxVersion: "VersionTLS13"
+      sslStrategies:
+        - "tls.SniStrict"
+      cipherSuites:
+        - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305"
+        - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        - "TLS_RSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_RSA_WITH_AES_128_GCM_SHA256"
+      curvePreferences:
+        - CurveP521
+        - CurveP384
+
+    # Default TLS options
+    default:
+      minVersion: "VersionTLS12"
+      maxVersion: "VersionTLS13"
+
+# HTTP Middlewares
+http:
+  middlewares:
+    # Security Headers
+    securityHeaders:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - OPTIONS
+          - PUT
+          - POST
+          - DELETE
+          - PATCH
+        accessControlAllowOriginList:
+          - "https://*"
+        accessControlMaxAge: 100
+        addVaryHeader: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+        forceSTSHeader: true
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+        customResponseHeaders:
+          X-Frame-Options: "DENY"
+          X-Content-Type-Options: "nosniff"
+          X-XSS-Protection: "1; mode=block"
+          Strict-Transport-Security: "max-age=31536000; includeSubDomains; preload"
+          Content-Security-Policy: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' wss: https:; frame-ancestors 'none';"
+          Referrer-Policy: "strict-origin-when-cross-origin"
+          Permissions-Policy: "geolocation=(), microphone=(), camera=(), payment=(), usb=(), vr=(), accelerometer=(), gyroscope=(), magnetometer=(), clipboard-read=(), clipboard-write=()"
+
+    # Compression
+    gzip:
+      compress:
+        minResponseBodyBytes: 1024
+
+    # Rate Limiting - Global
+    globalRateLimit:
+      rateLimit:
+        average: 1000
+        period: 1m
+        burst: 100
+
+    # Rate Limiting - API
+    apiRateLimit:
+      rateLimit:
+        average: 100
+        period: 1m
+        burst: 50
+
+    # Rate Limiting - Strict
+    strictRateLimit:
+      rateLimit:
+        average: 10
+        period: 1m
+        burst: 5
+
+    # IP Whitelist (example - customize as needed)
+    # ipWhitelist:
+    #   ipWhiteList:
+    #     sourceRange:
+    #       - "127.0.0.1/32"
+    #       - "10.0.0.0/8"
+    #       - "172.16.0.0/12"
+    #       - "192.168.0.0/16"
+
+    # Basic Auth (for admin endpoints)
+    basicAuth:
+      basicAuth:
+        users:
+          # Default: admin:admin (change in production!)
+          # Generate with: echo $(htpasswd -nb admin yourpassword) | sed -e s/\\$/\\$\\$/g
+          - "admin:$$2y$$10$$0000000000000000000000000000000000000000000000000000000000"
+
+    # CORS Headers for API
+    corsHeaders:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - OPTIONS
+          - PUT
+          - POST
+          - DELETE
+          - PATCH
+        accessControlAllowHeaders:
+          - "*"
+        accessControlAllowOriginList:
+          - "*"
+        accessControlMaxAge: 86400
+        addVaryHeader: true
+
+# Ping endpoint for health checks
+ping:
+  entryPoint: websecure
+
+# Tracing (optional - uncomment to enable)
+# tracing:
+#   jaeger:
+#     samplingServerURL: http://jaeger:14268/api/sampling
+#     localAgentHostPort: jaeger:6831
+
+# Experimental features
+experimental:
+  plugins:
+    # Example: fail2ban plugin (requires installation)
+    # fail2ban:
+    #   moduleName: "github.com/tomMoulard/fail2ban"
+    #   version: "v0.6.6"

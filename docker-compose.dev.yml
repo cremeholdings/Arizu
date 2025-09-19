@@ -1,0 +1,124 @@
+services:
+  postgres:
+    image: postgres:14
+    container_name: arizu_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-arizu_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password_123}
+      POSTGRES_DB: ${POSTGRES_DB:-arizu_dev}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data_dev:/var/lib/postgresql/data
+    networks:
+      - dev_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arizu_dev} -d ${POSTGRES_DB:-arizu_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: arizu_redis_dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_dev:/data
+    networks:
+      - dev_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: arizu_n8n_dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Core n8n configuration
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_LISTEN_ADDRESS: 0.0.0.0
+
+      # Database configuration
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-arizu_dev}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-dev_password_123}
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-arizu_dev}
+      DB_POSTGRESDB_SCHEMA: public
+
+      # Redis/Queue configuration
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_DB: 0
+
+      # Development settings
+      N8N_LOG_LEVEL: debug
+      N8N_METRICS: true
+      N8N_DIAGNOSTICS_ENABLED: true
+
+      # Security (dev only)
+      N8N_BASIC_AUTH_ACTIVE: false
+      N8N_DISABLE_PRODUCTION_MAIN_PROCESS: false
+
+      # Webhook configuration
+      WEBHOOK_URL: http://localhost:5678
+      N8N_PAYLOAD_SIZE_MAX: 16
+
+      # Execution settings
+      EXECUTIONS_PROCESS: main
+      EXECUTIONS_MODE: regular
+      EXECUTIONS_TIMEOUT: 3600
+      EXECUTIONS_TIMEOUT_MAX: 7200
+
+      # Timezone
+      TZ: ${TZ:-UTC}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data_dev:/home/node/.n8n
+    networks:
+      - dev_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  pg_data_dev:
+    name: arizu_pg_data_dev
+    driver: local
+  redis_data_dev:
+    name: arizu_redis_data_dev
+    driver: local
+  n8n_data_dev:
+    name: arizu_n8n_data_dev
+    driver: local
+
+networks:
+  dev_net:
+    name: arizu_dev_net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
