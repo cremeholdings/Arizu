@@ -1,0 +1,296 @@
+name: Synthetic Smoke Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to test"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+          - staging
+      webhook_test:
+        description: "Run synthetic webhook tests"
+        required: false
+        default: true
+        type: boolean
+      verbose:
+        description: "Enable verbose output"
+        required: false
+        default: false
+        type: boolean
+
+  deployment_status:
+    types: [success]
+
+  schedule:
+    # Run every hour during business hours (9 AM - 6 PM UTC)
+    - cron: '0 9-18 * * 1-5'
+
+env:
+  SMOKE_VERBOSE: ${{ github.event.inputs.verbose || '0' }}
+
+jobs:
+  smoke:
+    name: Synthetic Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+          chmod +x scripts/smoke-*.sh
+
+      - name: Set environment URLs
+        id: set-urls
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "staging" ]; then
+            echo "APP_URL=${{ secrets.STAGING_APP_URL || 'https://staging.arizu.com' }}" >> $GITHUB_ENV
+            echo "N8N_URL=${{ secrets.STAGING_N8N_URL || 'https://workflows.staging.arizu.com' }}" >> $GITHUB_ENV
+            echo "WEBHOOK_TOKEN=${{ secrets.STAGING_WEBHOOK_TOKEN }}" >> $GITHUB_ENV
+          else
+            echo "APP_URL=${{ secrets.APP_URL || 'https://arizu.com' }}" >> $GITHUB_ENV
+            echo "N8N_URL=${{ secrets.N8N_URL || 'https://workflows.arizu.com' }}" >> $GITHUB_ENV
+            echo "WEBHOOK_TOKEN=${{ secrets.WEBHOOK_TOKEN }}" >> $GITHUB_ENV
+          fi
+
+          echo "Testing environment: ${{ github.event.inputs.environment || 'production' }}"
+
+      - name: Application health check
+        env:
+          APP_TIMEOUT: 30
+        run: |
+          echo "🩺 Running application health check..."
+          echo "Target: $APP_URL"
+
+          if ! ./scripts/smoke-app.sh; then
+            echo "❌ Application health check failed"
+            exit 1
+          fi
+
+          echo "✅ Application health check passed"
+
+      - name: n8n connectivity check
+        env:
+          N8N_TIMEOUT: 30
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+        run: |
+          echo "🔧 Running n8n connectivity check..."
+          echo "Target: $N8N_URL"
+
+          if ! ./scripts/smoke-n8n.sh; then
+            echo "❌ n8n connectivity check failed"
+            exit 1
+          fi
+
+          echo "✅ n8n connectivity check passed"
+
+      - name: Synthetic webhook test
+        if: ${{ github.event.inputs.webhook_test != 'false' }}
+        env:
+          APP_TIMEOUT: 30
+        run: |
+          echo "🪝 Running synthetic webhook test..."
+
+          # Generate unique test run ID
+          RUN_ID="smoke-$(date +%s)-${{ github.run_number }}"
+          echo "Test Run ID: $RUN_ID"
+
+          # Test webhook ingestion endpoint
+          WEBHOOK_URL="$APP_URL/api/hooks/ingest"
+
+          echo "Testing webhook endpoint: $WEBHOOK_URL"
+
+          # Prepare webhook payload
+          PAYLOAD='{
+            "runId": "'$RUN_ID'",
+            "status": "ok",
+            "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'",
+            "source": "synthetic-smoke-test",
+            "environment": "'${{ github.event.inputs.environment || 'production' }}'",
+            "metadata": {
+              "workflow": "smoke-test",
+              "github_sha": "'${{ github.sha }}'",
+              "github_run_id": "'${{ github.run_id }}'"
+            }
+          }'
+
+          echo "Payload:"
+          echo "$PAYLOAD" | jq .
+
+          # Send webhook request
+          echo "Sending webhook request..."
+
+          RESPONSE=$(curl -sS --max-time $APP_TIMEOUT \
+            -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: GitHub-Synthetic-Smoke/1.0" \
+            ${WEBHOOK_TOKEN:+-H "Authorization: Bearer $WEBHOOK_TOKEN"} \
+            -d "$PAYLOAD" \
+            -w "HTTPSTATUS:%{http_code}")
+
+          # Extract HTTP status and response body
+          HTTP_BODY=$(echo "$RESPONSE" | sed -E 's/HTTPSTATUS\:[0-9]{3}$//')
+          HTTP_STATUS=$(echo "$RESPONSE" | tr -d '\n' | sed -E 's/.*HTTPSTATUS:([0-9]{3})$/\1/')
+
+          echo "HTTP Status: $HTTP_STATUS"
+          echo "Response Body: $HTTP_BODY"
+
+          # Validate response
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ Webhook request succeeded (HTTP $HTTP_STATUS)"
+
+            # Try to parse JSON response
+            if echo "$HTTP_BODY" | jq empty >/dev/null 2>&1; then
+              echo "Response JSON:"
+              echo "$HTTP_BODY" | jq .
+
+              # Check for success indicators in response
+              if echo "$HTTP_BODY" | jq -e '.success == true or .ok == true or .status == "success"' >/dev/null 2>&1; then
+                echo "✅ Webhook processing succeeded"
+              else
+                echo "⚠️ Webhook accepted but response indicates processing issues"
+                echo "$HTTP_BODY" | jq .
+              fi
+            else
+              echo "⚠️ Non-JSON response received: $HTTP_BODY"
+            fi
+          else
+            echo "❌ Webhook request failed (HTTP $HTTP_STATUS)"
+            echo "Response: $HTTP_BODY"
+            exit 1
+          fi
+
+      - name: Synthetic workflow trigger test
+        if: ${{ github.event.inputs.webhook_test != 'false' && secrets.N8N_API_KEY != '' }}
+        env:
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+          N8N_TIMEOUT: 60
+        run: |
+          echo "🔄 Testing n8n workflow trigger..."
+
+          # Test n8n workflow execution (if test workflow exists)
+          WORKFLOW_URL="$N8N_URL/api/v1/workflows"
+
+          echo "Checking available workflows..."
+
+          WORKFLOWS_RESPONSE=$(curl -sS --max-time $N8N_TIMEOUT \
+            -H "X-N8N-API-KEY: $N8N_API_KEY" \
+            "$WORKFLOW_URL" 2>/dev/null || echo "[]")
+
+          echo "Available workflows:"
+          echo "$WORKFLOWS_RESPONSE" | jq -r '.[] | select(.name | test("test|smoke|health"; "i")) | "\(.id): \(.name)"' || echo "No test workflows found"
+
+          # Look for a smoke test workflow
+          SMOKE_WORKFLOW_ID=$(echo "$WORKFLOWS_RESPONSE" | jq -r '.[] | select(.name | test("smoke|test"; "i")) | .id' | head -1)
+
+          if [ "$SMOKE_WORKFLOW_ID" != "" ] && [ "$SMOKE_WORKFLOW_ID" != "null" ]; then
+            echo "Found smoke test workflow: $SMOKE_WORKFLOW_ID"
+            echo "Triggering workflow execution..."
+
+            EXECUTION_RESPONSE=$(curl -sS --max-time $N8N_TIMEOUT \
+              -X POST "$N8N_URL/api/v1/workflows/$SMOKE_WORKFLOW_ID/execute" \
+              -H "X-N8N-API-KEY: $N8N_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{"data": {"source": "github-smoke-test", "runId": "'$(date +%s)'"}}' 2>/dev/null || echo '{"error": "execution failed"}')
+
+            echo "Execution response:"
+            echo "$EXECUTION_RESPONSE" | jq .
+
+            if echo "$EXECUTION_RESPONSE" | jq -e '.data.id' >/dev/null 2>&1; then
+              echo "✅ Workflow execution triggered successfully"
+            else
+              echo "⚠️ Workflow execution may have failed"
+            fi
+          else
+            echo "ℹ️ No smoke test workflow found - skipping workflow trigger test"
+          fi
+
+      - name: Performance baseline check
+        run: |
+          echo "⚡ Running performance baseline check..."
+
+          # Measure response times for key endpoints
+          ENDPOINTS=(
+            "$APP_URL/api/health"
+            "$APP_URL/status"
+            "$APP_URL/"
+          )
+
+          for endpoint in "${ENDPOINTS[@]}"; do
+            echo "Testing: $endpoint"
+
+            RESPONSE_TIME=$(curl -sS --max-time 10 \
+              -o /dev/null \
+              -w "%{time_total}" \
+              "$endpoint" 2>/dev/null || echo "timeout")
+
+            if [ "$RESPONSE_TIME" != "timeout" ]; then
+              RESPONSE_MS=$(echo "$RESPONSE_TIME * 1000" | bc -l | cut -d. -f1)
+              echo "  Response time: ${RESPONSE_MS}ms"
+
+              # Check against SLO thresholds
+              if [ "$RESPONSE_MS" -gt 2000 ]; then
+                echo "  ⚠️ Slow response (>2s)"
+              elif [ "$RESPONSE_MS" -gt 1000 ]; then
+                echo "  ⚠️ Degraded performance (>1s)"
+              else
+                echo "  ✅ Good performance"
+              fi
+            else
+              echo "  ❌ Timeout or error"
+            fi
+          done
+
+      - name: Generate smoke test report
+        if: always()
+        run: |
+          echo "📊 Smoke Test Summary"
+          echo "===================="
+          echo "Environment: ${{ github.event.inputs.environment || 'production' }}"
+          echo "Trigger: ${{ github.event_name }}"
+          echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "GitHub SHA: ${{ github.sha }}"
+          echo "Run ID: ${{ github.run_id }}"
+
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Status: ✅ PASSED"
+          else
+            echo "Status: ❌ FAILED"
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          channel: '#alerts'
+          username: 'Synthetic Smoke Tests'
+          text: |
+            🚨 Synthetic smoke tests failed!
+            Environment: ${{ github.event.inputs.environment || 'production' }}
+            Trigger: ${{ github.event_name }}
+            Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify on success (manual runs only)
+        if: success() && github.event_name == 'workflow_dispatch'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          channel: '#deployments'
+          username: 'Synthetic Smoke Tests'
+          text: |
+            ✅ Synthetic smoke tests passed!
+            Environment: ${{ github.event.inputs.environment }}
+            All systems operational
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

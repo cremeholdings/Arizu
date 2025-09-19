@@ -1,0 +1,191 @@
+name: n8n Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g., main or v0.1.0)"
+        required: true
+        default: "main"
+      environment:
+        description: "Target environment (staging/production)"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ${{ secrets.REGISTRY }}
+  IMAGE_NAME: ${{ secrets.IMAGE }}
+
+jobs:
+  build-push:
+    name: Build and Push n8n Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.event.inputs.tag }}
+            type=raw,value=${{ github.event.inputs.tag }}-{{sha}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./n8n
+          file: ./n8n/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Log build completion
+        run: |
+          echo "✅ Successfully built and pushed image"
+          echo "Registry: ${{ env.REGISTRY }}"
+          echo "Image: ${{ env.IMAGE_NAME }}"
+          echo "Tag: ${{ github.event.inputs.tag }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+
+  remote-deploy:
+    name: Deploy to Remote Server
+    needs: build-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to staging
+        if: github.event.inputs.environment == 'staging'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST_STAGING }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          timeout: 300s
+          script: |
+            echo "🚀 Starting n8n deployment to staging..."
+
+            # Navigate to project directory
+            cd ${{ secrets.COMPOSE_PATH_STAGING }}
+
+            # Load environment variables
+            export $(grep -v '^#' .env.docker.staging | xargs) || true
+            export N8N_IMAGE_TAG=${{ github.event.inputs.tag }}
+
+            # Pull latest image
+            echo "📦 Pulling n8n image..."
+            docker compose -f docker-compose.staging.yml pull n8n
+
+            # Stop n8n service gracefully
+            echo "🛑 Stopping n8n service..."
+            docker compose -f docker-compose.staging.yml stop n8n
+
+            # Start n8n with new image
+            echo "▶️ Starting n8n service..."
+            docker compose -f docker-compose.staging.yml up -d n8n
+
+            # Wait for service to be healthy
+            echo "🔍 Waiting for n8n to be healthy..."
+            timeout 120s bash -c 'until curl -f http://localhost:5678/healthz >/dev/null 2>&1; do sleep 5; done' || {
+              echo "❌ n8n health check failed"
+              docker compose -f docker-compose.staging.yml logs n8n --tail=50
+              exit 1
+            }
+
+            # Cleanup old images
+            echo "🧹 Cleaning up old images..."
+            docker system prune -f --filter "until=24h"
+
+            echo "✅ n8n staging deployment completed successfully"
+
+      - name: Deploy to production
+        if: github.event.inputs.environment == 'production'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST_PRODUCTION }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          timeout: 300s
+          script: |
+            echo "🚀 Starting n8n deployment to production..."
+
+            # Navigate to project directory
+            cd ${{ secrets.COMPOSE_PATH_PRODUCTION }}
+
+            # Load environment variables
+            export $(grep -v '^#' .env.docker.prod | xargs) || true
+            export N8N_IMAGE_TAG=${{ github.event.inputs.tag }}
+
+            # Pull latest image
+            echo "📦 Pulling n8n image..."
+            docker compose -f docker-compose.prod.yml pull n8n
+
+            # Create backup before deployment
+            echo "💾 Creating backup..."
+            ./scripts/n8n-backup.sh || echo "⚠️ Backup failed, continuing..."
+
+            # Stop n8n service gracefully
+            echo "🛑 Stopping n8n service..."
+            docker compose -f docker-compose.prod.yml stop n8n
+
+            # Start n8n with new image
+            echo "▶️ Starting n8n service..."
+            docker compose -f docker-compose.prod.yml up -d n8n
+
+            # Wait for service to be healthy
+            echo "🔍 Waiting for n8n to be healthy..."
+            timeout 120s bash -c 'until curl -f http://localhost:5678/healthz >/dev/null 2>&1; do sleep 5; done' || {
+              echo "❌ n8n health check failed"
+              docker compose -f docker-compose.prod.yml logs n8n --tail=50
+              exit 1
+            }
+
+            # Cleanup old images
+            echo "🧹 Cleaning up old images..."
+            docker system prune -f --filter "until=24h"
+
+            echo "✅ n8n production deployment completed successfully"
+
+  notify:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [build-push, remote-deploy]
+    if: always()
+
+    steps:
+      - name: Notify deployment status
+        uses: 8398a7/action-slack@v3
+        if: env.SLACK_WEBHOOK_URL != ''
+        with:
+          status: ${{ needs.remote-deploy.result }}
+          channel: '#deployments'
+          username: 'GitHub Actions'
+          text: |
+            n8n deployment to ${{ github.event.inputs.environment }} ${{ needs.remote-deploy.result }}!
+            Image Tag: ${{ github.event.inputs.tag }}
+            Triggered by: ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
